@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -6,9 +7,6 @@ import html
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Union
-
-from motor.motor_asyncio import AsyncIOMotorClient
-from pymongo.errors import PyMongoError
 
 from telegram import (
     Update,
@@ -41,8 +39,7 @@ logger = logging.getLogger("LinkProviderBot")
 # Environment Configuration
 # -----------------------------------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017").strip()
-MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "link_provider_bot").strip()
+DB_FILE = os.getenv("DB_FILE", "database.json").strip()
 
 LOG_CHANNEL_ID_RAW = os.getenv("LOG_CHANNEL_ID", "").strip()
 LOG_CHANNEL_ID = int(LOG_CHANNEL_ID_RAW) if LOG_CHANNEL_ID_RAW.lstrip("-").isdigit() else None
@@ -58,10 +55,6 @@ if ADMIN_IDS_RAW:
 if not BOT_TOKEN:
     logger.critical("BOT_TOKEN environment variable missing! Exiting...")
 
-# Global DB client variable
-db_client: Optional[AsyncIOMotorClient] = None
-db = None
-
 # Default Fallback Settings
 DEFAULT_START_TEXT = (
     "<b>Welcome to Link Provider Bot!</b>\n\n"
@@ -72,7 +65,7 @@ DEFAULT_ABOUT_TEXT = (
     "• Single-use high-security invite links.\n"
     "• Automatic 2-minute expiration.\n"
     "• Private join-request integration.\n"
-    "• Built with python-telegram-bot & MongoDB."
+    "• Built with python-telegram-bot & JSON Database."
 )
 DEFAULT_HELP_TEXT = (
     "<b>How to use this bot:</b>\n\n"
@@ -83,42 +76,257 @@ DEFAULT_HELP_TEXT = (
 )
 
 # -----------------------------------------------------------------------------
+# JSON Database Implementation
+# -----------------------------------------------------------------------------
+def _serialize_value(val: Any) -> Any:
+    if isinstance(val, datetime):
+        if val.tzinfo is None:
+            val = val.replace(tzinfo=timezone.utc)
+        return val.isoformat()
+    if isinstance(val, dict):
+        return {k: _serialize_value(v) for k, v in val.items()}
+    if isinstance(val, list):
+        return [_serialize_value(v) for v in val]
+    return val
+
+def _deserialize_value(val: Any) -> Any:
+    if isinstance(val, dict):
+        return {k: _deserialize_value(v) for k, v in val.items()}
+    if isinstance(val, list):
+        return [_deserialize_value(v) for v in val]
+    if isinstance(val, str):
+        # Attempt ISO datetime parsing if string looks like datetime
+        if len(val) >= 19 and ("T" in val):
+            try:
+                return datetime.fromisoformat(val)
+            except ValueError:
+                pass
+    return val
+
+def _matches_query(doc: Dict[str, Any], query: Dict[str, Any]) -> bool:
+    for k, v in query.items():
+        doc_val = _deserialize_value(doc.get(k))
+        if isinstance(v, dict):
+            # Operators like $lte, $inc, etc. handled per field
+            for op, op_val in v.items():
+                parsed_op_val = _deserialize_value(op_val)
+                if op == "$lte":
+                    if doc_val is None or doc_val > parsed_op_val:
+                        return False
+                elif op == "$gte":
+                    if doc_val is None or doc_val < parsed_op_val:
+                        return False
+                elif op == "$lt":
+                    if doc_val is None or doc_val >= parsed_op_val:
+                        return False
+                elif op == "$gt":
+                    if doc_val is None or doc_val <= parsed_op_val:
+                        return False
+                elif op == "$ne":
+                    if doc_val == parsed_op_val:
+                        return False
+        else:
+            if doc_val != _deserialize_value(v):
+                return False
+    return True
+
+class JSONCollectionCursor:
+    def __init__(self, data: List[Dict[str, Any]]):
+        self._data = list(data)
+
+    def sort(self, key: str, direction: int = 1):
+        reverse = direction < 0
+        self._data.sort(key=lambda x: x.get(key, 0) or 0, reverse=reverse)
+        return self
+
+    def limit(self, count: int):
+        self._data = self._data[:count]
+        return self
+
+    async def to_list(self, length: Optional[int] = None) -> List[Dict[str, Any]]:
+        if length is not None:
+            return self._data[:length]
+        return self._data
+
+class JSONCollection:
+    def __init__(self, db: "JSONDatabase", name: str):
+        self.db = db
+        self.name = name
+
+    async def find_one(self, query: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        async with self.db.lock:
+            docs = self.db.data.get(self.name, [])
+            if not query:
+                return _deserialize_value(docs[0]) if docs else None
+            for d in docs:
+                if _matches_query(d, query):
+                    return _deserialize_value(d)
+            return None
+
+    def find(self, query: Optional[Dict[str, Any]] = None) -> JSONCollectionCursor:
+        docs = self.db.data.get(self.name, [])
+        matched = []
+        for d in docs:
+            if not query or _matches_query(d, query):
+                matched.append(_deserialize_value(d))
+        return JSONCollectionCursor(matched)
+
+    async def insert_one(self, doc: Dict[str, Any]):
+        async with self.db.lock:
+            serialized_doc = _serialize_value(doc)
+            if self.name not in self.db.data:
+                self.db.data[self.name] = []
+            self.db.data[self.name].append(serialized_doc)
+            await self.db._save()
+
+    async def update_one(self, query: Dict[str, Any], update: Dict[str, Any], upsert: bool = False):
+        async with self.db.lock:
+            docs = self.db.data.get(self.name, [])
+            target = None
+            for d in docs:
+                if _matches_query(d, query):
+                    target = d
+                    break
+
+            if target is None:
+                if upsert:
+                    new_doc = {}
+                    for k, v in query.items():
+                        if not k.startswith("$"):
+                            new_doc[k] = v
+                    if "$set" in update:
+                        for k, v in update["$set"].items():
+                            new_doc[k] = _serialize_value(v)
+                    if "$setOnInsert" in update:
+                        for k, v in update["$setOnInsert"].items():
+                            new_doc[k] = _serialize_value(v)
+                    if "$inc" in update:
+                        for k, v in update["$inc"].items():
+                            new_doc[k] = new_doc.get(k, 0) + v
+
+                    serialized_doc = _serialize_value(new_doc)
+                    if self.name not in self.db.data:
+                        self.db.data[self.name] = []
+                    self.db.data[self.name].append(serialized_doc)
+                    await self.db._save()
+                return
+
+            if "$set" in update:
+                for k, v in update["$set"].items():
+                    target[k] = _serialize_value(v)
+            if "$inc" in update:
+                for k, v in update["$inc"].items():
+                    target[k] = target.get(k, 0) + v
+
+            await self.db._save()
+
+    async def delete_one(self, query: Dict[str, Any]):
+        class DeleteResult:
+            def __init__(self, count):
+                self.deleted_count = count
+
+        async with self.db.lock:
+            docs = self.db.data.get(self.name, [])
+            for idx, d in enumerate(docs):
+                if _matches_query(d, query):
+                    del docs[idx]
+                    await self.db._save()
+                    return DeleteResult(1)
+            return DeleteResult(0)
+
+    async def count_documents(self, query: Optional[Dict[str, Any]] = None) -> int:
+        async with self.db.lock:
+            docs = self.db.data.get(self.name, [])
+            if not query:
+                return len(docs)
+            return sum(1 for d in docs if _matches_query(d, query))
+
+class SettingsWrapper:
+    def __init__(self, db: "JSONDatabase"):
+        self.db = db
+
+    async def find_one(self, query: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        async with self.db.lock:
+            return _deserialize_value(self.db.data.get("settings", {}))
+
+    async def update_one(self, query: Dict[str, Any], update: Dict[str, Any], upsert: bool = True):
+        async with self.db.lock:
+            settings = self.db.data.get("settings", {})
+            if "$set" in update:
+                for k, v in update["$set"].items():
+                    settings[k] = _serialize_value(v)
+            self.db.data["settings"] = settings
+            await self.db._save()
+
+class JSONDatabase:
+    def __init__(self, file_path: str):
+        self.file_path = file_path
+        self.lock = asyncio.Lock()
+        self.data: Dict[str, Any] = {}
+
+        self.users = JSONCollection(self, "users")
+        self.bans = JSONCollection(self, "bans")
+        self.channels = JSONCollection(self, "channels")
+        self.forcesub = JSONCollection(self, "forcesub")
+        self.links = JSONCollection(self, "links")
+        self.forcesub_access = JSONCollection(self, "forcesub_access")
+        self.settings = SettingsWrapper(self)
+
+    async def load(self):
+        async with self.lock:
+            if os.path.exists(self.file_path):
+                try:
+                    with open(self.file_path, "r", encoding="utf-8") as f:
+                        self.data = json.load(f)
+                except Exception as e:
+                    logger.error(f"Failed to read JSON DB file {self.file_path}: {e}")
+                    self.data = {}
+            else:
+                self.data = {}
+
+            # Ensure default structures
+            for col in ["users", "bans", "channels", "forcesub", "links", "forcesub_access"]:
+                if col not in self.data or not isinstance(self.data[col], list):
+                    self.data[col] = []
+
+            if "settings" not in self.data or not isinstance(self.data["settings"], dict):
+                self.data["settings"] = {
+                    "_id": "global",
+                    "start_photo": "",
+                    "start_text": DEFAULT_START_TEXT,
+                    "about_text": DEFAULT_ABOUT_TEXT,
+                    "help_text": DEFAULT_HELP_TEXT,
+                    "about_button": "ℹ️ ABOUT",
+                    "help_button": "❓ HELP",
+                    "req_toggle": False,
+                    "autodelete_enabled": True
+                }
+            await self._save()
+
+    async def _save(self):
+        # Must be called while holding self.lock
+        try:
+            temp_file = f"{self.file_path}.tmp"
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, indent=2, ensure_ascii=False)
+            os.replace(temp_file, self.file_path)
+        except Exception as e:
+            logger.error(f"Failed to save JSON DB file {self.file_path}: {e}")
+
+# Global Database Instance
+db: Optional[JSONDatabase] = None
+
+# -----------------------------------------------------------------------------
 # Database Setup & Helper Functions
 # -----------------------------------------------------------------------------
 async def init_db():
-    global db_client, db
+    global db
     try:
-        db_client = AsyncIOMotorClient(MONGO_URI)
-        db = db_client[MONGO_DB_NAME]
-        # Test connection
-        await db.command("ping")
-        logger.info(f"Successfully connected to MongoDB database: {MONGO_DB_NAME}")
-
-        # Ensure indexes
-        await db.users.create_index("user_id", unique=True)
-        await db.bans.create_index("user_id", unique=True)
-        await db.channels.create_index("chat_id", unique=True)
-        await db.forcesub.create_index("chat_id", unique=True)
-        await db.links.create_index("link", unique=True)
-        await db.links.create_index([("expires_at", 1), ("is_revoked", 1)])
-        await db.forcesub_access.create_index([("user_id", 1), ("chat_id", 1)], unique=True)
-
-        # Initialize settings if missing
-        settings = await db.settings.find_one({"_id": "global"})
-        if not settings:
-            await db.settings.insert_one({
-                "_id": "global",
-                "start_photo": "",
-                "start_text": DEFAULT_START_TEXT,
-                "about_text": DEFAULT_ABOUT_TEXT,
-                "help_text": DEFAULT_HELP_TEXT,
-                "about_button": "ℹ️ ABOUT",
-                "help_button": "❓ HELP",
-                "req_toggle": False,
-                "autodelete_enabled": True
-            })
+        db = JSONDatabase(DB_FILE)
+        await db.load()
+        logger.info(f"Successfully initialized JSON Database at: {DB_FILE}")
     except Exception as e:
-        logger.critical(f"MongoDB connection failed: {e}")
+        logger.critical(f"JSON Database initialization failed: {e}")
         sys.exit(1)
 
 async def post_init(app: Application):
@@ -134,6 +342,7 @@ async def get_settings() -> Dict[str, Any]:
     settings = await db.settings.find_one({"_id": "global"})
     if not settings:
         return {
+            "_id": "global",
             "start_photo": "",
             "start_text": DEFAULT_START_TEXT,
             "about_text": DEFAULT_ABOUT_TEXT,
@@ -458,7 +667,7 @@ async def join_request_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         try:
             await context.bot.approve_chat_join_request(chat_id=chat_id, user_id=user_id)
             await db.links.update_one(
-                {"_id": link_doc["_id"]},
+                {"link": link_doc["link"]},
                 {
                     "$inc": {"clicks": 1},
                     "$set": {"is_revoked": True}
@@ -505,7 +714,7 @@ async def background_link_cleanup_loop(app: Application):
                         logger.debug(f"Revoke link exception for {doc['link']}: {e}")
 
                     await db.links.update_one(
-                        {"_id": doc["_id"]},
+                        {"link": doc["link"]},
                         {"$set": {"is_revoked": True}}
                     )
 
